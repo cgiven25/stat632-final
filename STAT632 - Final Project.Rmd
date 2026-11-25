@@ -1,0 +1,617 @@
+---
+title: 'RMarkdown: STAT632 Final Project'
+author: 'Marisa Patel'
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+  toc: FALSE
+number_sections: TRUE
+---
+
+#updated research question:
+#Do major US airlines differ significantly in their joint departure and arrival delays. If so, what are the possible drivers of the delays
+
+#POSSIBLE PREDICTORS: 
+#busyness(no of flights departing from each airport)
+#origin state 
+#destination state 
+#distance traveled
+#scheduled departure time
+#season - does it affect time blocks?
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Upload Data
+```{r}
+library(tidyverse)
+library(lubridate)
+library(car)
+library(broom)
+
+flights <- read_csv("./flights_sample.csv")
+
+# Inspect the data
+dim(flights)
+names(flights)
+glimpse(flights)
+
+```
+
+Data Cleaning: Remove missing values
+```{r}
+flights_clean <- flights %>%
+  filter(
+    cancelled == 0,
+    diverted == 0,
+    !is.na(dep_delay),
+    !is.na(arr_delay)
+  ) %>%
+  mutate(
+    FL_DATE = as.Date(flight_date),
+
+    MONTH = month(flight_date),
+
+    DAY_OF_WEEK = wday(flight_date, label = TRUE),
+
+    DEP_PERIOD = case_when(
+      dep_time < 600 ~ "Early Morning",
+      dep_time < 1200 ~ "Morning",
+      dep_time < 1800 ~ "Afternoon",
+      TRUE ~ "Evening"
+    ),
+
+    DELAY_RECOVERY = dep_delay - arr_delay
+  )
+
+dim(flights_clean)
+# Removed about 10,000 rows and 5 columns
+#Excludes cancelled and diverted flights
+#Does not replace missing values with 0
+```
+
+Exploratory Analysis
+```{r}
+# Departure vs. arrival delay
+ggplot(flights_clean,
+       aes(x = dep_delay, y = arr_delay)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm") +
+  labs(
+    title = "Relationship Between Departure and Arrival Delays",
+    x = "Departure Delay (minutes)",
+    y = "Arrival Delay (minutes)"
+  )
+
+# Average delays by airline
+flights_clean %>%
+  group_by(airline) %>%
+  summarise(
+    mean_dep = mean(dep_delay),
+    mean_arr = mean(arr_delay)
+  )
+
+```
+
+Correlation Matrices among variables
+```{r}
+library(corrplot)
+names(flights_clean)
+
+numeric_data <- flights_clean %>%
+  select(
+    dep_delay,
+    arr_delay,
+    year,
+    distance,
+    air_time,
+    taxi_out,
+    taxi_in
+  ) %>%
+  drop_na()
+
+cor_matrix <- cor(numeric_data)
+
+corrplot(cor_matrix,
+         method = "color",
+         type = "upper",
+         addCoef.col = "black")
+
+# Pearson correlation
+cor(numeric_data, use = "complete.obs",
+    method = "pearson")
+
+```
+Strong correlations between arrival delay and departure delay, as well as
+airtime and distance. 
+I also believe there may be Simpson's Paradox at play, where the variables
+may show a higher correlation when we group by Airline.
+
+## Create a subset of the dataset with the predictors of interest and create
+##some metrics 
+
+Upload data and examine dataset
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+
+# Load dataset
+flights <- read_csv("./flights_sample.csv") %>%
+  clean_names()
+
+# Examine dataset
+dim(flights)
+names(flights)
+glimpse(flights)
+
+#investigating missingness
+naniar::miss_var_summary(flights) #results suggest that missingness may be systematic rather than random
+
+flights |>
+  count(cancelled, is.na(cancellation_reason))
+#all non-cancelled flights have missing cancellation reasons
+#there are no cancelled flights with missing cancellation reasons
+#we can keep in case we want to investigate cancellation reasons
+
+flights |>
+  count(arr_del15, missing_carrier_delay = is.na(carrier_delay))
+#we actually have missing arrival-delay indicators and also have missing carrier delay values
+
+delay_vars <- c(
+  "carrier_delay",
+  "weather_delay",
+  "nas_delay",
+  "security_delay",
+  "late_aircraft_delay"
+)
+
+flights %>%
+  group_by(arr_del15) %>%
+  summarise(
+    across(
+      all_of(delay_vars),
+      ~ sum(is.na(.x))
+    ),
+    .groups = "drop"
+  )
+#missing values were only recorded for flights that arrived at least 15 mins late
+#flights that do not meet this threshold have missing vlaues for all 5 variables
+
+flights %>%
+  count(
+    cancelled,
+    diverted,
+    missing_arr_delay = is.na(arr_delay)
+  )
+#all cancelled and diverted flights have missing arrival delays.
+#the 2.07% missingness in arrival delay is entirely explained by cancellations and diversions
+
+# Number and percentage of missing values per variable
+missing_summary <- flights %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "missing"
+  ) %>%
+  mutate(
+    percent_missing = round(missing / nrow(flights_top5) * 100, 2)
+  ) %>%
+  arrange(desc(percent_missing))
+
+missing_summary
+
+```
+
+Limit data to the top five airlines
+```{r}
+
+# Rank airlines by number of flights
+top5_airlines <- flights %>%
+  count(airline, airline_code, sort = TRUE) %>%
+  slice_max(n, n = 5, with_ties = FALSE)
+
+top5_airlines
+
+# Visualize flight counts
+ggplot(top5_airlines,
+       aes(x = reorder(airline, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Five Airlines by Number of Flights",
+    x = "Airline",
+    y = "Number of Flights"
+  ) +
+  theme_minimal()
+
+```
+
+Calculate airport busyness metric
+```{r}
+
+total_flights <- nrow(flights)
+
+# Origin airport activity
+origin_busy <- flights %>%
+  count(origin, name = "origin_flight_count") %>%
+  mutate(
+    origin_busyness = origin_flight_count / total_flights
+  )
+
+# Destination airport activity
+dest_busy <- flights %>%
+  count(dest, name = "dest_flight_count") %>%
+  mutate(
+    dest_busyness = dest_flight_count / total_flights
+  )
+
+# Join airport activity measures to flight data
+flights <- flights %>%
+  left_join(origin_busy, by = "origin") %>%
+  left_join(dest_busy, by = "dest")
+
+```
+
+Create season metric based on departure date, and blocks of time for
+scheduled departure time
+```{r}
+
+flights <- flights %>%
+  mutate(
+    flight_date = as.Date(flight_date),
+
+    # Season
+    month = month(flight_date),
+
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% c(3, 4, 5) ~ "Spring",
+      month %in% c(6, 7, 8) ~ "Summer",
+      month %in% c(9, 10, 11) ~ "Fall",
+      TRUE ~ NA_character_
+    ),
+
+    season = factor(
+      season,
+      levels = c("Winter", "Spring", "Summer", "Fall")
+    ),
+
+    # Extract scheduled departure hour
+    dep_hour = floor(sched_dep_time / 100),
+
+    # Departure period
+    dep_period = case_when(
+      dep_hour >= 0 & dep_hour < 8 ~ "Early Morning",
+      dep_hour >= 6 & dep_hour < 12 ~ "Morning",
+      dep_hour >= 12 & dep_hour < 18 ~ "Afternoon",
+      dep_hour >= 18 & dep_hour < 24 ~ "Evening",
+      TRUE ~ NA_character_
+    ),
+
+    dep_period = factor(
+      dep_period,
+      levels = c(
+        "Early Morning",
+        "Morning",
+        "Afternoon",
+        "Evening"
+      )
+    )
+  )
+
+```
+
+Add origin and destination states
+```{r}
+
+flights_top5 <- flights %>%
+  semi_join(
+    top5_airlines,
+    by = c("airline", "airline_code")
+  )
+
+# Check final dataset
+dim(flights_top5)
+glimpse(flights_top5)
+
+# Verify airline counts
+flights_top5 %>%
+  count(airline, sort = TRUE)
+
+```
+
+Validate final dataset
+```{r}
+
+# Check missing values
+missing_summary <- flights_top5 %>%
+  summarise(across(everything(),
+                   ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "missing_count"
+  ) %>%
+  arrange(desc(missing_count))
+
+missing_summary
+
+# Check season distribution
+flights_top5 %>%
+  count(season)
+
+# Check departure period distribution
+flights_top5 %>%
+  count(dep_period)
+
+# Check airport busyness
+summary(flights_top5$origin_busyness)
+summary(flights_top5$dest_busyness)
+
+# Check date range
+range(flights_top5$flight_date, na.rm = TRUE)
+
+# Check cancellations and diversions
+flights_top5 %>%
+  summarise(
+    cancellation_rate = mean(cancelled == 1, na.rm = TRUE),
+    diversion_rate = mean(diverted == 1, na.rm = TRUE)
+  )
+
+#Check airlines is top 5 only
+flights_top5 %>%
+  count(airline)
+
+#Final Dataset:
+flights_top5
+
+```
+
+## Multivariate Multiple Regression
+```{r}
+#Remove missing values and cancelled/diverted flights
+flights_model <- flights_top5 %>%
+  filter(
+    !is.na(dep_delay),
+    !is.na(arr_delay)
+  )
+
+flights_model <- flights_model %>%
+  filter(
+    cancelled == 0,
+    diverted == 0
+  )
+
+#Remove rows with missing values of the important variables
+model_variables <- c(
+  "dep_delay",
+  "arr_delay",
+  "airline",
+  "season",
+  "origin_state",
+  "dest_state",
+  "dep_period",
+  "origin_busyness",
+  "dest_busyness",
+  "distance",
+  "sched_elapsed_time"
+)
+
+flights_model <- flights_model %>%
+  drop_na(all_of(model_variables))
+
+#Data ready for modeling:
+# Compare observations
+data.frame(
+  Dataset = c("Original", "After Cleaning"),
+  Observations = c(
+    nrow(flights_top5),
+    nrow(flights_model)
+  )
+) %>%
+  mutate(
+    Percent_Retained = round(
+      Observations / nrow(flights_top5) * 100, 2
+    )
+  )
+```
+
+```{r}
+library(tidyverse)
+library(car)
+
+# Prepare modeling dataset
+flight_reg <- flights_model %>%
+  select(
+    arr_delay,
+    dep_delay,
+    airline,
+    season,
+    origin_state,
+    dest_state,
+    distance,
+    origin_busyness,
+    dest_busyness,
+    dep_period
+  ) %>%
+  drop_na() %>%
+  mutate(
+    season = factor(season),
+    origin_state = factor(origin_state),
+    dest_state = factor(dest_state),
+    dep_period = factor(dep_period)
+  )
+
+# Check structure
+glimpse(flight_reg)
+
+# Number of observations
+nrow(flight_reg)
+
+#Turn airline into a factor
+flight_reg <- flight_reg %>%
+  mutate(
+    airline = as.factor(airline)
+  )
+
+
+#Reference categories for the factor variables
+flight_reg <- flight_reg %>%
+  mutate(
+    airline = relevel(airline,ref = "American Airlines"),
+    season = relevel(season, ref = "Winter"),
+    dep_period = relevel(dep_period, ref = "Early Morning")
+  )
+```
+
+Fit the multiple regression
+```{r}
+# Multivariate multiple regression controlling for airline
+flight_mlr_airline <- manova(
+  cbind(arr_delay, dep_delay) ~
+    airline +
+    season +
+    origin_state +
+    dest_state +
+    distance +
+    origin_busyness +
+    dest_busyness +
+    dep_period,
+  data = flight_reg
+)
+
+summary(flight_mlr_airline, test = "Pillai")
+
+#Compare the four tests:
+#Ho: The predictor has no effect on either response
+#Ha: The predictor has an effect on at least one response
+
+# Pillai's Trace
+summary(flight_mlr, test = "Pillai")
+
+# Wilks' Lambda
+summary(flight_mlr, test = "Wilks")
+
+# Hotelling-Lawley Trace
+summary(flight_mlr, test = "Hotelling-Lawley")
+
+# Roy's Largest Root
+summary(flight_mlr, test = "Roy")
+```
+Combine results across tests to see which predictors are strongest association
+```{r}
+# Extract MANOVA results
+pillai_results <- summary(
+  flight_mlr_airline,
+  test = "Pillai"
+)$stats
+
+wilks_results <- summary(
+  flight_mlr_airline,
+  test = "Wilks"
+)$stats
+
+hotelling_results <- summary(
+  flight_mlr_airline,
+  test = "Hotelling-Lawley"
+)$stats
+
+roy_results <- summary(
+  flight_mlr_airline,
+  test = "Roy"
+)$stats
+
+#Combine
+ranking_results <- data.frame(
+  Predictor = rownames(pillai_results),
+  Pillai = pillai_results[, "Pillai"],
+  Wilks = wilks_results[, "Wilks"],
+  Hotelling = hotelling_results[, "Hotelling-Lawley"],
+  Roy = roy_results[, "Roy"]
+) %>%
+  filter(Predictor != "Residuals")
+
+# Pillai: largest is strongest
+pillai_rank <- ranking_results %>%
+  arrange(desc(Pillai)) %>%
+  mutate(Pillai_Rank = row_number())
+
+# Wilks: smallest is strongest
+wilks_rank <- ranking_results %>%
+  arrange(Wilks) %>%
+  mutate(Wilks_Rank = row_number())
+
+# Hotelling: largest is strongest
+hotelling_rank <- ranking_results %>%
+  arrange(desc(Hotelling)) %>%
+  mutate(Hotelling_Rank = row_number())
+
+# Roy: largest is strongest
+roy_rank <- ranking_results %>%
+  arrange(desc(Roy)) %>%
+  mutate(Roy_Rank = row_number())
+
+combined_ranking <- ranking_results %>%
+  left_join(
+    pillai_rank %>% select(Predictor, Pillai_Rank),
+    by = "Predictor"
+  ) %>%
+  left_join(
+    wilks_rank %>% select(Predictor, Wilks_Rank),
+    by = "Predictor"
+  ) %>%
+  left_join(
+    hotelling_rank %>% select(Predictor, Hotelling_Rank),
+    by = "Predictor"
+  ) %>%
+  left_join(
+    roy_rank %>% select(Predictor, Roy_Rank),
+    by = "Predictor"
+  ) %>%
+  mutate(
+    Average_Rank = rowMeans(
+      across(ends_with("_Rank"))
+    )
+  ) %>%
+  arrange(Average_Rank)
+
+combined_ranking
+```
+
+Across the four tests, departure period is the predictor with the highest
+association to departure delay. 
+Findings:
+1. Departure period has the strongest association.
+
+Its Pillai's Trace of 0.01549 is the largest of all predictors. This suggests 
+that the time of day a flight is scheduled to depart is particularly relevant 
+to explaining differences in arrival and departure delays.
+
+2. Airline differences are important.
+
+The Pillai's Trace of 0.00735 suggests that the five airlines have different 
+combined delay patterns, even after considering the other predictors in your model.
+
+3. Geographic location matters.
+
+Both origin state and destination state are statistically significant. This 
+suggests that where flights originate and where they land are associated with 
+their delay patterns.
+
+4. Airport busyness has relatively small associations.
+
+Origin and destination busyness have the smallest Pillai's Trace values. 
+They are statistically significant, but their multivariate associations are 
+comparatively small.
+
+Evaluate the coefficients:
+```{r}
+coef(flight_mlr_airline)
+```
+
+
